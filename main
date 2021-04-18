@@ -1,0 +1,1301 @@
+# Imports  
+import os
+import pandas as pd
+import glob
+import json 
+import ast
+import re
+import random
+
+# Connection to google drive
+from google.colab import drive
+drive.mount('/content/drive', force_remount=True)
+
+#If you've already ran lines 18-36, just ignore those and run line 38
+#lines 18-36 are creating fasttext embeddings for each word and storing it in a 
+#csv file to be used later. I did this to save time and RAM because it took hours to 
+#load the fasttext model and it took up a ton of RAM
+pip install fasttext
+import fasttext.util
+fasttext.util.download_model('en', if_exists='ignore')  # English
+ft = fasttext.load_model('cc.en.300.bin')
+bigDF = pd.read_csv("/content/drive/My Drive/College/DAML/Annotations2.csv")
+allWords = bigDF['OCR_text']
+for i in range(len(allWords)):
+    allWords[i] = (str)(allWords[i])
+wordSet = set(allWords)
+
+embeddingsDF = pd.DataFrame(columns = wordSet)
+embeddingsDict = {}
+for word in wordSet:
+    embeddingsDict[word] = ft[word]
+
+for word in wordSet:
+    embeddingsDF[word] = embeddingsDict[word]
+os.chdir("/content/drive/My Drive/College/DAML/")
+embeddingsDF.to_csv("embeddingsDict.csv")
+
+embeddingsDict = pd.read_csv("/content/drive/My Drive/College/DAML/embeddingsDict.csv")
+
+
+
+#Keith: lines 44-787 are from Grapher.py
+
+import numpy as np
+import pandas as pd
+import cv2
+import os
+folderName = r"/home/arjun/Downloads/cord_text-20201130T203217Z-001/cord_text/" #Don't think we need this -Keith
+# for making adjacency matrix
+import networkx as nx
+import nltk
+import gensim
+from gensim.models import FastText
+nltk.download('stopwords') #might not need this 
+
+
+
+sent_tokenize = []
+#with open("/content/drive/My Drive/College/DAML/blankTextFile.txt", 'rb') as document:
+ #   sent_tokenize.append(document.read().decode('utf-8').split())
+    
+
+
+
+class ObjectTree:
+    '''
+		Description:
+		-----------
+			This class is used to generate a dictionary of lists that contain
+			the graph structure:
+				{src_id: [dest_id1, dest_id2, ..]}
+			and return the list of text entities in the input document
+		Example use:
+		-----------
+			>> connector = ObjectTree(label_column='label')
+			>> connector.read(object_map_df, img)
+			>> df, obj_list = connector.connect(plot=False, export_df=False)
+	'''
+
+    def __init__(self, label_column='label'):
+        self.label_column = label_column
+        self.df = None
+        self.img = None
+        self.count = 0
+
+    def read(self, object_map, image):
+
+        '''
+			Function to ensure the data is in correct format and saves the
+			dataframe and image as class properties
+			Args:
+				object_map: pd.DataFrame, having coordinates of bounding boxes,
+										  text object and label
+				image: np.array, black and white cv2 image
+			Returns:
+				None
+		'''
+
+        assert type(object_map) == pd.DataFrame, f'object_map should be of type \
+			{pd.DataFrame}. Received {type(object_map)}'
+        assert type(image) == np.ndarray, f'image should be of type {np.ndarray} \
+			. Received {type(image)}'
+
+        assert 'xmin' in object_map.columns, '"xmin" not in object map'
+        assert 'xmax' in object_map.columns, '"xmax" not in object map'
+        assert 'ymin' in object_map.columns, '"ymin" not in object map'
+        assert 'ymax' in object_map.columns, '"ymax" not in object map'
+        assert 'Object' in object_map.columns, '"Object" column not in object map'
+        # assert self.label_column in object_map.columns, \
+        #				f'"{self.label_column}" does not exist in the object map'
+
+        # check if image is greyscale
+        assert image.ndim == 2, 'Check if the read image is greyscale.'
+
+        # drop unneeded columns
+        required_cols = {'xmin', 'xmax', 'ymin', 'ymax', 'Object'}
+        un_required_cols = set(object_map.columns) - required_cols
+        object_map.drop(columns=un_required_cols, inplace=True)
+
+        self.df = object_map
+        self.img = image
+        return
+
+    def connect(self, plot=False, export_df=False):
+
+        '''
+			This method implements the logic to generate a graph based on
+			visibility. If a horizontal/vertical line can be drawn from one
+			node to another, the two nodes are connected.
+			Args:
+				plot (default=False):
+					bool, whether to plot the graph;
+					the graph is plotted in at path ./grapher_outputs/plots
+				export_df (default=False):
+					bool, whether to export the dataframe containing graph
+					information;
+					the dataframe is exported as csv to path
+					./grapher_outputs/connections
+		'''
+        df, img = self.df, self.img
+
+        # check if object map was successfully read by .read() method
+        try:
+            if len(df) == 0:
+                return
+        except:
+            return
+
+        # initialize empty df to store plotting coordinates
+        df_plot = pd.DataFrame()
+
+        # initialize empty lists to store coordinates and distances
+        # ================== vertical======================================== #
+        distances, nearest_dest_ids_vert = [], []
+
+        x_src_coords_vert, y_src_coords_vert, x_dest_coords_vert, \
+        y_dest_coords_vert = [], [], [], []
+
+        # ======================= horizontal ================================ #
+        lengths, nearest_dest_ids_hori = [], []
+
+        x_src_coords_hori, y_src_coords_hori, x_dest_coords_hori, \
+        y_dest_coords_hori = [], [], [], []
+
+        for src_idx, src_row in df.iterrows():
+
+            # ================= vertical ======================= #
+            src_range_x = (src_row['xmin'], src_row['xmax'])
+            src_center_y = (src_row['ymin'] + src_row['ymax']) / 2
+
+            dest_attr_vert = []
+
+            # ================= horizontal ===================== #
+            src_range_y = (src_row['ymin'], src_row['ymax'])
+            src_center_x = (src_row['xmin'] + src_row['xmax']) / 2
+
+            dest_attr_hori = []
+
+            ################ iterate over destination objects #################
+            for dest_idx, dest_row in df.iterrows():
+                # flag to signal whether the destination object is below source
+                is_beneath = False
+                if not src_idx == dest_idx:
+                    # ==================== vertical ==========================#
+                    dest_range_x = (dest_row['xmin'], dest_row['xmax'])
+                    dest_center_y = (dest_row['ymin'] + dest_row['ymax']) / 2
+
+                    height = dest_center_y - src_center_y
+
+                    # consider only the cases where destination object lies
+                    # below source
+                    if dest_center_y > src_center_y:
+                        # check if horizontal range of dest lies within range
+                        # of source
+
+                        # case 1
+                        ###        source
+                        ###     destination
+                        if dest_range_x[0] <= src_range_x[0] and \
+                                dest_range_x[1] >= src_range_x[1]:
+
+                            x_common = (src_range_x[0] + src_range_x[1]) / 2
+
+                            line_src = (x_common, src_center_y)
+                            line_dest = (x_common, dest_center_y)
+
+                            attributes = (dest_idx, line_src, line_dest, height)
+                            dest_attr_vert.append(attributes)
+
+                            is_beneath = True
+
+
+                        # case 2
+                        elif dest_range_x[0] >= src_range_x[0] and \
+                                dest_range_x[1] <= src_range_x[1]:
+
+                            x_common = (dest_range_x[0] + dest_range_x[1]) / 2
+
+                            line_src = (x_common, src_center_y)
+                            line_dest = (x_common, dest_center_y)
+
+                            attributes = (dest_idx, line_src, line_dest, height)
+                            dest_attr_vert.append(attributes)
+
+                            is_beneath = True
+
+                        # case 3
+                        elif dest_range_x[0] <= src_range_x[0] and \
+                                dest_range_x[1] >= src_range_x[0] and \
+                                dest_range_x[1] < src_range_x[1]:
+
+                            x_common = (src_range_x[0] + dest_range_x[1]) / 2
+
+                            line_src = (x_common, src_center_y)
+                            line_dest = (x_common, dest_center_y)
+
+                            attributes = (dest_idx, line_src, line_dest, height)
+                            dest_attr_vert.append(attributes)
+
+                            is_beneath = True
+
+                        # case 4
+                        elif dest_range_x[0] <= src_range_x[1] and \
+                                dest_range_x[1] >= src_range_x[1] and \
+                                dest_range_x[0] > src_range_x[0]:
+
+                            x_common = (dest_range_x[0] + src_range_x[1]) / 2
+
+                            line_src = (x_common, src_center_y)
+                            line_dest = (x_common, dest_center_y)
+
+                            attributes = (dest_idx, line_src, line_dest, height)
+                            dest_attr_vert.append(attributes)
+
+                            is_beneath = True
+
+                if not is_beneath:
+                    # ======================= horizontal ==================== #
+                    dest_range_y = (dest_row['ymin'], dest_row['ymax'])
+                    # get center of destination NOTE: not used
+                    dest_center_x = (dest_row['xmin'] + dest_row['xmax']) / 2
+
+                    # get length from destination center to source center
+                    if dest_center_x > src_center_x:
+                        length = dest_center_x - src_center_x
+                    else:
+                        length = 0
+
+                    # consider only the cases where the destination object
+                    # lies to the right of source
+                    if dest_center_x > src_center_x:
+                        # check if vertical range of dest lies within range
+                        # of source
+
+                        # case 1
+                        if dest_range_y[0] >= src_range_y[0] and \
+                                dest_range_y[1] <= src_range_y[1]:
+                            y_common = (dest_range_y[0] + dest_range_y[1]) / 2
+
+                            line_src = (src_center_x, y_common)
+                            line_dest = (dest_center_x, y_common)
+
+                            attributes = (dest_idx, line_src, line_dest, length)
+                            dest_attr_hori.append(attributes)
+
+                        # case 2
+                        if dest_range_y[0] <= src_range_y[0] and \
+                                dest_range_y[1] <= src_range_y[1] and \
+                                dest_range_y[1] > src_range_y[0]:
+                            y_common = (src_range_y[0] + dest_range_y[1]) / 2
+
+                            line_src = (src_center_x, y_common)
+                            line_dest = (dest_center_x, y_common)
+
+                            attributes = (dest_idx, line_src, line_dest, length)
+                            dest_attr_hori.append(attributes)
+
+                        # case 3
+                        if dest_range_y[0] >= src_range_y[0] and \
+                                dest_range_y[1] >= src_range_y[1] and \
+                                dest_range_y[0] < src_range_y[1]:
+                            y_common = (dest_range_y[0] + src_range_y[1]) / 2
+
+                            line_src = (src_center_x, y_common)
+                            line_dest = (dest_center_x, y_common)
+
+                            attributes = (dest_idx, line_src, line_dest, length)
+                            dest_attr_hori.append(attributes)
+
+                        # case 4
+                        if dest_range_y[0] <= src_range_y[0] \
+                                and dest_range_y[1] >= src_range_y[1]:
+                            y_common = (src_range_y[0] + src_range_y[1]) / 2
+
+                            line_src = (src_center_x, y_common)
+                            line_dest = (dest_center_x, y_common)
+
+                            attributes = (dest_idx, line_src, line_dest, length)
+                            dest_attr_hori.append(attributes)
+
+            # sort list of destination attributes by height/length at position
+            # 3 in tuple
+            dest_attr_vert_sorted = sorted(dest_attr_vert, key=lambda x: x[3])
+            dest_attr_hori_sorted = sorted(dest_attr_hori, key=lambda x: x[3])
+
+            # append the index and source and destination coords to draw line
+            # ==================== vertical ================================= #
+            if len(dest_attr_vert_sorted) == 0:
+                nearest_dest_ids_vert.append(-1)
+                x_src_coords_vert.append(-1)
+                y_src_coords_vert.append(-1)
+                x_dest_coords_vert.append(-1)
+                y_dest_coords_vert.append(-1)
+                distances.append(0)
+            else:
+                nearest_dest_ids_vert.append(dest_attr_vert_sorted[0][0])
+                x_src_coords_vert.append(dest_attr_vert_sorted[0][1][0])
+                y_src_coords_vert.append(dest_attr_vert_sorted[0][1][1])
+                x_dest_coords_vert.append(dest_attr_vert_sorted[0][2][0])
+                y_dest_coords_vert.append(dest_attr_vert_sorted[0][2][1])
+                distances.append(dest_attr_vert_sorted[0][3])
+
+            # ========================== horizontal ========================= #
+            if len(dest_attr_hori_sorted) == 0:
+                nearest_dest_ids_hori.append(-1)
+                x_src_coords_hori.append(-1)
+                y_src_coords_hori.append(-1)
+                x_dest_coords_hori.append(-1)
+                y_dest_coords_hori.append(-1)
+                lengths.append(0)
+
+            else:
+                # try and except for the cases where there are vertical connections
+                # still to be made but all horizontal connections are accounted for
+                try:
+                    nearest_dest_ids_hori.append(dest_attr_hori_sorted[0][0])
+                except:
+                    nearest_dest_ids_hori.append(-1)
+
+                try:
+                    x_src_coords_hori.append(dest_attr_hori_sorted[0][1][0])
+                except:
+                    x_src_coords_hori.append(-1)
+
+                try:
+                    y_src_coords_hori.append(dest_attr_hori_sorted[0][1][1])
+                except:
+                    y_src_coords_hori.append(-1)
+
+                try:
+                    x_dest_coords_hori.append(dest_attr_hori_sorted[0][2][0])
+                except:
+                    x_dest_coords_hori.append(-1)
+
+                try:
+                    y_dest_coords_hori.append(dest_attr_hori_sorted[0][2][1])
+                except:
+                    y_dest_coords_hori.append(-1)
+
+                try:
+                    lengths.append(dest_attr_hori_sorted[0][3])
+                except:
+                    lengths.append(0)
+
+        # ==================== vertical ===================================== #
+        # create df for plotting lines
+        #
+        count_df = 0
+        df['below_object'] = df['Object']
+
+        for i in nearest_dest_ids_vert:
+            if i != -1:
+                df['below_object'][count_df] = df['Object'][i]
+
+            else:
+                df['below_object'][count_df] = None
+
+            count_df += 1
+
+        # df['below_object'] = df.reindex(index=nearest_dest_ids_vert, columns=['Object'])
+
+        # add distances column
+        df['below_dist'] = distances
+        # add column containing index of destination object
+        df['below_obj_index'] = nearest_dest_ids_vert
+        
+
+        # add coordinates for plotting
+        df_plot['x_src_vert'] = x_src_coords_vert
+        df_plot['y_src_vert'] = y_src_coords_vert
+        df_plot['x_dest_vert'] = x_dest_coords_vert
+        df_plot['y_dest_vert'] = y_dest_coords_vert
+
+        # df.fillna('NULL', inplace = True)
+
+        # ==================== horizontal =================================== #
+        # create df for plotting lines
+        count_df = 0
+        df['side_object'] = df['Object']
+        for i in nearest_dest_ids_hori:
+            if i != -1:
+                df['side_object'][count_df] = df['Object'][i]
+
+            else:
+                df['side_object'][count_df] = ''
+
+            count_df += 1
+
+        # print(df['side_object'])
+
+        # add lengths column
+        df['side_length'] = lengths
+
+        # add column containing index of destination object
+        df['side_obj_index'] = nearest_dest_ids_hori
+
+        # add coordinates for plotting
+        df_plot['x_src_hori'] = x_src_coords_hori
+        df_plot['y_src_hori'] = y_src_coords_hori
+        df_plot['x_dest_hori'] = x_dest_coords_hori
+        df_plot['y_dest_hori'] = y_dest_coords_hori
+
+        ########################## concat df and df_plot ######################
+        #Keith: I'm commenting out like the next 125 lines to avoid some errors
+        '''
+        df_merged = pd.concat([df, df_plot], axis=1)
+
+        # if an object has more than one parent above it, only the connection
+        # with the smallest distance is retained and the other distances are
+        # replaced by '-1' to get such objects, group by 'below_object' column
+        # and use minimum of 'below_dist'
+
+        # ======================= vertical ================================== #
+        groups_vert = df_merged.groupby('below_obj_index')['below_dist'].min()
+        # groups.index gives a list of the below_object text and groups.values
+        # gives the corresponding minimum distance
+        groups_dict_vert = dict(zip(groups_vert.index, groups_vert.values))
+
+        # ======================= horizontal ================================ #
+        groups_hori = df_merged.groupby('side_obj_index')['side_length'].min()
+        # groups.index gives a list of the below_object text and groups.values
+        # gives the corresponding minimum distance
+        groups_dict_hori = dict(zip(groups_hori.index, groups_hori.values))
+
+        revised_distances_vert = []
+        revised_distances_hori = []
+
+        rev_x_src_vert, rev_y_src_vert, rev_x_dest_vert, rev_y_dest_vert = \
+            [], [], [], []
+        rev_x_src_hori, rev_y_src_hori, rev_x_dest_hori, rev_y_dest_hori = \
+            [], [], [], []
+        #print(df_merged['below_obj_index'])
+        for idx, row in df_merged.iterrows():
+            below_idx = row['below_obj_index']
+
+            side_idx = row['side_obj_index']
+
+            # ======================== vertical ============================= #
+            if row['below_dist'] > groups_dict_vert[below_idx]:
+                revised_distances_vert.append(-1)
+                rev_x_src_vert.append(-1)
+                rev_y_src_vert.append(-1)
+                rev_x_dest_vert.append(-1)
+                rev_y_dest_vert.append(-1)
+
+            else:
+                revised_distances_vert.append(row['below_dist'])
+                rev_x_src_vert.append(row['x_src_vert'])
+                rev_y_src_vert.append(row['y_src_vert'])
+                rev_x_dest_vert.append(row['x_dest_vert'])
+                rev_y_dest_vert.append(row['y_dest_vert'])
+
+            # ========================== horizontal ========================= #
+            if row['side_length'] > groups_dict_hori[side_idx]:
+                revised_distances_hori.append(-1)
+                rev_x_src_hori.append(-1)
+                rev_y_src_hori.append(-1)
+                rev_x_dest_hori.append(-1)
+                rev_y_dest_hori.append(-1)
+
+            else:
+                revised_distances_hori.append(row['side_length'])
+                rev_x_src_hori.append(row['x_src_hori'])
+                rev_y_src_hori.append(row['y_src_hori'])
+                rev_x_dest_hori.append(row['x_dest_hori'])
+                rev_y_dest_hori.append(row['y_dest_hori'])
+
+        # store in dataframe
+        # ============================ vertical ============================= #
+        df['revised_distances_vert'] = revised_distances_vert
+        df_merged['x_src_vert'] = rev_x_src_vert
+        df_merged['y_src_vert'] = rev_y_src_vert
+        df_merged['x_dest_vert'] = rev_x_dest_vert
+        df_merged['y_dest_vert'] = rev_y_dest_vert
+
+        # ======================== horizontal =============================== #
+        df['revised_distances_hori'] = revised_distances_hori
+        df_merged['x_src_hori'] = rev_x_src_hori
+        df_merged['y_src_hori'] = rev_y_src_hori
+        df_merged['x_dest_hori'] = rev_x_dest_hori
+        df_merged['y_dest_hori'] = rev_y_dest_hori
+
+        # plot image if plot==True
+        if plot == True:
+
+            # make folder to store output
+            if not os.path.exists('grapher_outputs'):
+                os.makedirs('grapher_outputs')
+
+            # subdirectory to store plots
+            if not os.path.exists('./grapher_outputs/plots'):
+                os.makedirs('./grapher_outputs/plots')
+
+            # check if image exists in folder
+            try:
+                if len(img) == None:
+                    pass
+            except:
+                pass
+
+            # plot if image exists
+            else:
+                img_dup = img
+                for idx, row in df_merged.iterrows():
+                    cv2.line(img_dup,
+                             (int(row['x_src_vert']), int(row['y_src_vert'])),
+                             (int(row['x_dest_vert']), int(row['y_dest_vert'])),
+                             (0, 255, 0), 2)
+
+                    cv2.line(img_dup,
+                             (int(row['x_src_hori']), int(row['y_src_hori'])),
+                             (int(row['x_dest_hori']), int(row['y_dest_hori'])),
+                             (0, 0, 255), 2)
+
+                PLOT_PATH = \
+                    './grapher_outputs/plots/' + 'object_tree_' + str(self.count) + '.jpg'
+                cv2.imwrite(PLOT_PATH, img_dup)
+
+        # export dataframe with destination objects to csv in same folder
+        if export_df == True:
+
+            # make folder to store output
+            if not os.path.exists('grapher_outputs'):
+                os.makedirs('grapher_outputs')
+
+            # subdirectory to store plots
+            if not os.path.exists('./grapher_outputs/connections'):
+                os.makedirs('./grapher_outputs/connections')
+
+            CSV_PATH = \
+                './grapher_outputs/connections/' + 'connections_' + str(self.count) + '.csv'
+
+            df.to_csv(CSV_PATH, index=None)
+
+        # convert dataframe to dict:
+        # {src_id: dest_1, dest_2, ..}
+        '''
+
+        graph_dict = {}
+        for src_id, row in df.iterrows():
+
+            if row['below_obj_index'] != -1 and row['side_obj_index'] != -1:
+                graph_dict[src_id] = [row['below_obj_index'], row['side_obj_index']]
+
+            elif row['side_obj_index'] != -1:
+                graph_dict[src_id] = [row['side_obj_index']]
+
+            elif row['below_obj_index'] != -1:
+                graph_dict[src_id] = [row['below_obj_index']]
+
+        return graph_dict, df['Object'].tolist()
+
+
+class Graph:
+    '''
+		This class generates a padded adjacency matrix and a feature matrix
+	'''
+
+    def __init__(self, max_nodes=50):
+        self.max_nodes = max_nodes
+        return
+
+    # def make_graph(self, graph_dict):
+    # 	'''
+    # 		Function to make networkx graph
+
+    # 		Args:
+    # 			graph_dict: dict of lists,
+    # 						{src_id: [dest_id]}
+
+    # 		Returns:
+    # 			G:
+    # 				Padded adjacency matrix of size (max_nodes, max_nodes)
+
+    # 			feats:
+    # 				Padded feature matrix of size (max_nodes, m)
+    # 				(m: dimension of node text vector)
+    # 	'''
+    # 	G = nx.from_dict_of_lists(graph_dict)
+
+    # 	return G
+
+    def _get_text_features(self, data):
+
+        '''
+			Args:
+				str, input data
+			Returns:
+				np.array, shape=(22,);
+				an array of the text converted to features
+		'''
+
+        try:
+            assert type(data) == str, f'Expected type {str}. Received {type(data)}.'
+        except:
+            print(data)
+            raise
+        n_upper = 0
+        n_lower = 0
+        n_alpha = 0
+        n_digits = 0
+        n_spaces = 0
+        n_numeric = 0
+        n_special = 0
+        number = 0
+        special_chars = {'&': 0, '@': 1, '#': 2, '(': 3, ')': 4, '-': 5, '+': 6,
+                         '=': 7, '*': 8, '%': 9, '.': 10, ',': 11, '\\': 12, '/': 13,
+                         '|': 14, ':': 15}
+
+        special_chars_arr = np.zeros(shape=len(special_chars))
+
+        # character wise
+        for char in data:
+
+            # for lower letters
+            if char.islower():
+                n_lower += 1
+
+            # for upper letters
+            if char.isupper():
+                n_upper += 1
+
+            # for white spaces
+            if char.isspace():
+                n_spaces += 1
+
+            # for alphabetic chars
+            if char.isalpha():
+                n_alpha += 1
+
+            # for numeric chars
+            if char.isnumeric():
+                n_numeric += 1
+
+            # array for special chars
+            if char in special_chars.keys():
+                char_idx = special_chars[char]
+                # put 1 at index
+                special_chars_arr[char_idx] += 1
+
+        # word wise
+        for word in data.split():
+
+            # if digit is integer
+            try:
+                number = int(word)
+                n_digits += 1
+            except:
+                pass
+
+            # if digit is float
+            if n_digits==1:
+                try:
+                    number = float(word)
+                    n_digits += 1
+                except:
+                    pass
+        
+        #Keith: is the stuff below ok outside of the for loop above? 
+        features = []
+
+        features.append([n_lower, n_upper, n_spaces, n_alpha, n_numeric, n_digits])
+
+        features = np.array(features)
+        features = np.append(features, np.array(special_chars_arr))
+        wordEmbedding = np.zeros(300)
+        try:
+            wordEmbedding = embeddingsDict[(str)(word)]
+        except:
+            print(word, " not recognized")
+        features = np.append(features,np.array(wordEmbedding))
+        return features
+
+    def _pad_adj(self, adj):
+        '''
+			This method resizes the input Adjacency matrix to shape
+			(self.max_nodes, self.max_nodes)
+			adj:
+				2d numpy array
+				adjacency matrix
+		'''
+
+        assert adj.shape[0] == adj.shape[1], f'The input adjacency matrix is \
+			not square and has shape {adj.shape}'
+
+        # get n of nxn matrix
+        n = adj.shape[0]
+
+        if n < self.max_nodes:
+            target = np.zeros(shape=(self.max_nodes, self.max_nodes))
+
+            # fill in the target matrix with the adjacency
+            target[:adj.shape[0], :adj.shape[1]] = adj
+
+        elif n > self.max_nodes:
+            # cut away the excess rows and columns of adj
+            target = adj[:self.max_nodes, :self.max_nodes]
+
+        else:
+            # do nothing
+            target = adj
+
+        return target
+
+    def _pad_text_features(self, feat_arr):
+        '''
+			This method pads the feature matrix to size
+			(self.max_nodes, feat_arr.shape[1])
+		'''
+        target = np.zeros(shape=(self.max_nodes, feat_arr.shape[1]))
+        if self.max_nodes > feat_arr.shape[0]:
+            #print('1')
+            target[:feat_arr.shape[0], :feat_arr.shape[1]] = feat_arr
+        elif self.max_nodes < feat_arr.shape[0]:
+            target = feat_arr[:self.max_nodes, :feat_arr.shape[1]]
+        else:
+            target = feat_arr
+
+        return target
+
+    def make_graph_data(self, graph_dict, text_list):
+        '''
+			Function to make an adjacency matrix from a networkx graph object
+			as well as padded feature matrix
+			Args:
+				G: networkx graph object
+				text_list: list,
+							of text entities:
+							['Tax Invoice', '1/2/2019', ...]
+			Returns:
+				A: Adjacency matrix as np.array
+				X: Feature matrix as numpy array for input graph
+		'''
+        G = nx.from_dict_of_lists(graph_dict)
+        adj_sparse = nx.adjacency_matrix(G)
+
+        # preprocess the sparse adjacency matrix returned by networkx function
+        A = np.array(adj_sparse.todense())
+        A = self._pad_adj(A)
+        # preprocess the list of text entities
+
+        feat_list = list(map(self._get_text_features, text_list))
+
+        feat_arr = np.array(feat_list)
+        X = self._pad_text_features(feat_arr)
+
+        return A, X
+        
+        
+        
+#Keith: lines 792 - 878 contain utils.py from the original Github repo
+import numpy as np
+import scipy.sparse as sp
+import torch
+import random
+from sklearn.metrics import classification_report
+from scipy import sparse
+#folderName = r"/home/arjun/Downloads/cord_text-20201130T203217Z-001/cord_text/"
+import os
+import nltk
+import gensim
+
+
+def encode_onehot(labels):
+    classes = set(labels)
+    classes_dict = {c: np.identity(len(classes))[i, :] for i, c in
+                    enumerate(classes)}
+    labels_onehot = np.array(list(map(classes_dict.get, labels)),
+                             dtype=np.int32)
+    return labels_onehot
+
+
+def load_data(path="../data/cora/", dataset="cora",adj='', features='', labels='',index = ''):
+    """Load citation network dataset (cora only for now)"""
+    '''    print('Loading {} dataset...'.format(dataset))
+    idx_features_labels = np.genfromtxt("{}{}.content".format(path, dataset),
+                                        dtype=np.dtype(str))
+    '''
+  
+    labels= labels.iloc[:, 11:] #Keith: I think this should be 11
+
+    # build graph
+    '''
+    idx = np.array(idx_features_labels[:, 0], dtype=np.int32)
+    idx_map = {j: i for i, j in enumerate(idx)}
+    edges_unordered = np.genfromtxt("{}{}.cites".format(path, dataset),
+                                    dtype=np.int32)
+    edges = np.array(list(map(idx_map.get, edges_unordered.flatten())),
+                     dtype=np.int32).reshape(edges_unordered.shape)
+    '''
+
+    idx_train = range(index[int((0.7 *len(index)))]) 
+    idx_val = range(index[int(0.7*len(index))],index[int(0.8*len(index))])
+    idx_test = range(index[int(0.8*len(index))],index[int(1*len(index))-1])
+
+  
+    features = torch.FloatTensor(np.array(features.todense()))
+    labels = torch.LongTensor(np.where(labels)[1])
+
+    idx_train = torch.LongTensor(idx_train)
+    idx_val = torch.LongTensor(idx_val)
+    idx_test = torch.LongTensor(idx_test)
+
+    return adj, features, labels, idx_train, idx_val, idx_test
+  
+    
+def normalize(mx):
+    """Row-normalize sparse matrix"""
+    rowsum = np.array(mx.sum(1))
+    r_inv = np.power(rowsum, -1).flatten()
+    r_inv[np.isinf(r_inv)] = 0.
+    r_mat_inv = sp.diags(r_inv)
+    mx = r_mat_inv.dot(mx)
+    return mx
+
+
+def accuracy(output, labels,flag=True,target_names = ''):
+
+    preds = output.max(1)[1].type_as(labels)
+    if flag is False:
+        print(target_names)
+        print(classification_report(labels.detach().cpu(),preds.detach().cpu(),labels=range(len(target_names)),target_names = target_names))
+    correct = preds.eq(labels).double()
+
+    correct = correct.sum()
+
+    #print(correct / len(labels),'correct / len(labels)')
+    return correct / len(labels)
+
+
+def sparse_mx_to_torch_sparse_tensor(sparse_mx):
+    """Convert a scipy sparse matrix to a torch sparse tensor."""
+    sparse_mx = sparse_mx.tocoo().astype(np.float32)
+    indices = torch.from_numpy(
+        np.vstack((sparse_mx.row, sparse_mx.col)).astype(np.int64))
+    values = torch.from_numpy(sparse_mx.data)
+    shape = torch.Size(sparse_mx.shape)
+    return torch.sparse.FloatTensor(indices, values, shape)
+    
+ 
+#Keith: lines 882 - 927 contain what was originally in layers.py
+import math
+
+import torch
+
+from torch.nn.parameter import Parameter
+from torch.nn.modules.module import Module
+
+
+class GraphConvolution(Module):
+    """
+    Simple GCN layer, similar to https://arxiv.org/abs/1609.02907
+    """
+
+    def __init__(self, in_features, out_features, bias=True):
+        super(GraphConvolution, self).__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.weight = Parameter(torch.FloatTensor(in_features, out_features))
+        if bias:
+            self.bias = Parameter(torch.FloatTensor(out_features))
+        else:
+            self.register_parameter('bias', None)
+        self.reset_parameters()
+
+
+
+    def reset_parameters(self):
+        stdv = 1. / math.sqrt(self.weight.size(1))
+        self.weight.data.uniform_(-stdv, stdv)
+        if self.bias is not None:
+            self.bias.data.uniform_(-stdv, stdv)
+
+    def forward(self, input, adj):
+        support = torch.mm(input, self.weight)
+     
+        output = torch.spmm(adj, support)
+     
+        if self.bias is not None:
+            return output + self.bias
+        else:
+            return output
+
+    def __repr__(self):
+        return self.__class__.__name__ + ' (' \
+               + str(self.in_features) + ' -> ' \
+               + str(self.out_features) + ')'
+               
+
+#Keith: lines 931-947 create objects which are used to vary training parameters like learning rate
+class Args():
+    def __init__(self):
+        self.train_data_dir = "/content/drive/My Drive/College/DAML/trainData/"
+        self.test_data_dir = "/content/drive/My Drive/College/DAML/testData/"
+        self.model = "gcn"
+        self.lr = 0.00001
+        self.epochs = 20
+        self.hidden = 128
+        self.hidden1 = 64
+        self.no_cuda = False
+        self.dropout = 0.1
+        self.weight_decay = 0.0005
+        self.early_stopping = 10
+        self.max_degree = 3
+        self.seed = 89
+        self.fastmode = False
+        self.cuda = False
+
+
+#Keith: 951-971 is from models.py
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class GCN(nn.Module):
+    def __init__(self, nfeat, nhid, nclass, dropout):
+        super(GCN, self).__init__()
+
+        self.gc1 = GraphConvolution(nfeat, nhid)
+        self.gc2 = GraphConvolution(nhid, nclass)
+        self.dropout = dropout
+
+    def forward(self, x, adj):
+        #print(x.shape,'x')
+        #print(adj.shape,'adj')
+        x = F.relu(self.gc1(x, adj))
+        embeddings = x
+        x = F.dropout(x, self.dropout, training=self.training)
+
+        x = self.gc2(x, adj)
+        return F.log_softmax(x, dim=1)
+        
+#Keith: 974 - 1140 are used to prepare the data. Took about 2 hours for me to run.
+from __future__ import division
+from __future__ import print_function
+from scipy import sparse
+import scipy
+import scipy.sparse as sp
+import torch
+import json
+from scipy import sparse
+import time
+#import argparse
+import numpy as np
+import cv2
+#from grapher import ObjectTree, Graph
+import torch
+import torch.nn.functional as F
+import torch.optim as optim
+import pandas as pd
+#from utils import load_data, accuracy
+#from models import GCN
+import os
+import warnings
+warnings.filterwarnings('ignore')
+loss_plot = []
+
+
+def normalize(mx):
+    """Row-normalize sparse matrix"""
+    rowsum = np.array(mx.sum(1))
+    r_inv = np.power(rowsum, -1).flatten()
+    r_inv[np.isinf(r_inv)] = 0.
+    r_mat_inv = sp.diags(r_inv)
+    mx = r_mat_inv.dot(mx)
+    return mx
+
+
+def sparse_mx_to_torch_sparse_tensor(sparse_mx):
+    """Convert a scipy sparse matrix to a torch sparse tensor."""
+    sparse_mx = sparse_mx.tocoo().astype(np.float32)
+    indices = torch.from_numpy(
+        np.vstack((sparse_mx.row, sparse_mx.col)).astype(np.int64))
+    values = torch.from_numpy(sparse_mx.data)
+    shape = torch.Size(sparse_mx.shape)
+    return torch.sparse.FloatTensor(indices, values, shape)
+
+dataframe_collection = {}
+Image_count = 0
+
+
+adj_array = []
+features_array = []
+first_count = 0
+
+name = 'receipt_' 
+
+missing = []
+not_missing = []
+
+batch_size = 16
+####
+csvCounter = 0 #keeps track of which line we're on in the csv
+
+
+
+bigDF1 = pd.read_csv("/content/drive/My Drive/College/DAML/Annotations2.csv")
+bigDF = pd.DataFrame(columns = ['xmin', 'xmax', 'ymin', 'ymax', 'Object', 'fileName', 'label'])
+bigDF['xmin'] = bigDF1['@xtl']
+bigDF['xmax'] = bigDF1['@xbr']
+bigDF['ymin'] = bigDF1['@ytl']
+bigDF['ymax'] = bigDF1['@ybr']
+bigDF['Object'] = bigDF1['OCR_text']
+bigDF['label'] = bigDF1['label']
+bigDF['fileName'] = bigDF1['@name']
+ 
+
+
+FileNames = bigDF['fileName']
+stopLength = len(FileNames)
+numTotalFiles = 1792
+dummyImage = cv2.imread("/content/drive/My Drive/College/DAML/0325updated.task1train(626p)/X00016469619.jpg", 0) #Keith: this is a dumb fix to an error caused by not feeding an image into the read method of grapher.py
+
+for i in range(numTotalFiles): #keith: we have 1792 invoices total
+    if False: #Keith: i copy and pasted it in this format, but we don't need what they originally had here in the if statemetn
+        print("what just happened")
+    else:
+        not_missing.append(i) 
+
+        if not (FileNames[csvCounter] == FileNames[csvCounter + 2]):
+            csvCounter = csvCounter + 1
+
+
+        startFileName = FileNames[csvCounter]
+        currentFileName = startFileName
+        startIndex = csvCounter
+        while (currentFileName == startFileName):
+            csvCounter = csvCounter + 1
+            if csvCounter == stopLength:
+                break
+            currentFileName = FileNames[csvCounter]
+        endIndex = csvCounter
+
+        
+        interim = bigDF[startIndex: endIndex]
+        receipt_csv = pd.DataFrame(index = range(endIndex - startIndex), columns = ['xmin', 'xmax', 'ymin', 'ymax', 'Object', 'fileName', 'label'])
+        for rowCntr in range(endIndex - startIndex):
+            receipt_csv.loc[rowCntr] = pd.Series({'xmin': interim.loc[rowCntr + startIndex, 'xmin'], 'xmax': interim.loc[rowCntr + startIndex, 'xmax'], 'ymin': interim.loc[rowCntr + startIndex, 'ymin'], 'ymax': interim.loc[rowCntr + startIndex, 'ymax'], 'Object': interim.loc[rowCntr + startIndex, 'Object'], 'fileName': interim.loc[rowCntr + startIndex, 'fileName'], 'label': interim.loc[rowCntr + startIndex, 'label']})
+
+        for invIndex in receipt_csv.index:
+            receipt_csv.loc[invIndex, 'Object'] = str(receipt_csv.loc[invIndex, 'Object'])
+        
+        #q is used later on. - Keith
+        q = receipt_csv['label'] 
+
+        tree = ObjectTree()
+        #the line below should have save_name for the old grapher.py
+        tree.read(object_map = receipt_csv, image = dummyImage)
+        #the method used below returns 2 extra things for the old grapher.py
+        graph_dict, text_list = tree.connect(plot=False, export_df=False)
+
+        graph = Graph(max_nodes=len(text_list))
+        #print(endIndex - startIndex)
+        #if (len(q) == 1):
+         #   print(trainDF.loc[csvCounter, 'Object'])
+        #print(i)
+        adj, features = graph.make_graph_data(graph_dict, text_list)
+        adj = sparse.csr_matrix(adj)
+        adj = normalize(adj + sp.eye(adj.shape[0]))
+
+        # adj = sparse_mx_to_torch_sparse_tensor(adj)
+        if first_count == 0:
+            features_merged = features
+        else:
+            features_merged = np.concatenate((features_merged, features), axis=0)
+
+
+        adj_array.append(adj.todense())
+
+        features_array.append(features)
+
+
+
+        a = np.zeros(shape=(len(set(q)), len(q))).T
+        labels_df = pd.DataFrame(a, columns=set(q))
+        for j in range(len(q)):
+            labels_df.loc[j, q[j]] = 1
+
+        df_with_labels = pd.concat([receipt_csv, labels_df], axis=1)
+        if first_count == 0:
+            df_merged_labels = df_with_labels
+        else:
+            frames = [df_merged_labels, df_with_labels]
+            df_merged_labels = pd.concat(frames)
+        dataframe_collection['Image_' + str(i)] = df_with_labels
+        Image_count += 1
+        first_count += 1
+df_merged_labels.iloc[:, 8:] = df_merged_labels.iloc[:, 8:].fillna(0) 
+#Keith: the ppl who made this assumed the labels start at column 13. Don't think this applies to us so I changed from 13 to 8
+
+features_merged_sparse = sparse.csr_matrix(features_merged)
+
+os.chdir("/content/drive/My Drive/College/DAML/")
+
+#trainFandAdf = pd.DataFrame(data = {'features_array': features_array, 'adj_array': adj_array})
+#trainFeatMergedDF = pd.DataFrame(data = features_merged)
+
+#trainFandAdf.to_csv('trainFandAdf.csv', index=False) #has the features_array and adj_array for each training file
+#trainFeatMergedDF.to_csv("trainFeatMergedDF", index = False) #storing features_merged
+#df_merged_labels.to_csv('Traindf_merged_labels.csv', index=False)
+
+
+#Keith: 1143-1279 are used to train the model. Currently takes me about 12 seconds per epoch, which is strangely fast
+#if running this again, will have to get features_merged, features_array, adj_array and df_merged_labels
+#from what is on Drive
+args = Args()
+cum_sum = 0
+shape = []
+not_missing = list(range(1792))
+for i in not_missing:
+    shape.append(dataframe_collection['Image_' + str(i)].shape[0])
+
+image_index = np.cumsum(shape)
+from scipy.sparse import block_diag
+
+sparse_block_diag = block_diag(adj_array)
+
+values = sparse_block_diag.data
+indices = np.vstack((sparse_block_diag.row, sparse_block_diag.col))
+
+i = torch.LongTensor(indices)
+v = torch.FloatTensor(values)
+shape = sparse_block_diag.shape
+
+sp_adj = torch.sparse.FloatTensor(i, v, torch.Size(shape))
+
+
+#Keith: why are they passing df_merged_labels as labels?
+adj, features, labels, idx_train, idx_val, idx_test = load_data(adj=sp_adj, features=features_merged_sparse,
+                                                                labels=df_merged_labels, index=image_index)
+
+
+# Model and optimizer
+model = GCN(nfeat=features.shape[1],
+            nhid=args.hidden,
+            nclass=labels.max().item() + 1,
+            dropout=args.dropout)
+optimizer = optim.AdamW(model.parameters(),
+                        lr=args.lr, weight_decay=args.weight_decay)
+
+
+
+from torch.utils.tensorboard import SummaryWriter
+
+# default `log_dir` is "runs" - we'll be more specific here
+writer = SummaryWriter('runs/gcn_cord_batch')
+
+if args.cuda:
+    model.cuda()
+    features = features.cuda()
+    adj = adj.cuda()
+    labels = labels.cuda()
+    idx_train = idx_train.cuda()
+    idx_val = idx_val.cuda()
+    idx_test = idx_test.cuda()
+
+
+from statistics import mean
+
+numFinishedBatches = 0
+batch_size = 1
+def train(epoch):
+    print(epoch)
+    t = time.time()
+    model.train()
+    optimizer.zero_grad()
+    c = list(zip(not_missing, features_array, adj_array))
+
+    r, a, b = zip(*c)
+    rage = int(len(a) / (batch_size))
+    acc_avg_train = []
+    acc_avg_val = []
+    loss_avg_train = []
+    loss_avg_val = []
+    for i in range(rage):
+      
+        first_features = 0
+        for j in range(i * batch_size, (i + 1) * batch_size):
+            if first_features == 0:
+                labels_test_batch = dataframe_collection['Image_' + str(r[j])].iloc[:, 11:]
+                labels_test_batch = labels_test_batch.fillna(0)
+                features_sp_batch = a[j]
+                first_features += 1
+            else:
+                labels_test_batch = pd.concat(
+                    [labels_test_batch, dataframe_collection['Image_' + str(r[j])].iloc[:, 11:]])
+                labels_test_batch = labels_test_batch.fillna(0)
+                features_sp_batch = np.concatenate((features_sp_batch, a[j]), axis=0)
+
+   
+        labels = torch.LongTensor(np.where(labels_test_batch)[1])
+
+        sparse_block_diag = scipy.sparse.block_diag(adj_array[i * batch_size:(i + 1) * batch_size])
+
+        values = sparse_block_diag.data
+        indices = np.vstack((sparse_block_diag.row, sparse_block_diag.col))
+
+        i = torch.LongTensor(indices)
+        v = torch.FloatTensor(values)
+        shape = sparse_block_diag.shape
+
+        sp_adj = torch.sparse.FloatTensor(i, v, torch.Size(shape))
+        features_sp_merged_sparse = sparse.csr_matrix(features_sp_batch)
+        features_sp_merged_sparse = torch.FloatTensor(np.array(features_sp_merged_sparse.todense()))
+        idx_batch_train = range(features_sp_batch.shape[0] - 1)
+        idx_batch_val = range(features_sp_batch.shape[0] - 1)
+        idx_batch_train = torch.LongTensor(idx_batch_train)
+        idx_batch_val = torch.LongTensor(idx_batch_val)
+        output = model(features_sp_merged_sparse, sp_adj)
+        
+        loss_train = F.nll_loss(output[idx_batch_train], labels[idx_batch_train])
+        loss_train.backward()
+        optimizer.step()
+        loss_avg_train.append(loss_train.item())
+        acc_train = accuracy(output[idx_batch_train], labels[idx_batch_train])
+
+        acc_avg_train.append(acc_train)
+     
+
+    #print(loss_avg_train)
+    #writer.add_scalar('Loss/train', np.mean(np.array(loss_avg_train)), epoch)
+    print(np.mean(np.array(loss_avg_train)))
+    print(np.mean(np.array(acc_avg_train)))
+    #writer.add_scalar('acc/val', np.mean(np.array(acc_avg_val)), epoch)
+
+    print('epoch done')
+
+
+
+
+# Train model
+t_total = time.time()
+from tqdm import trange
+
+for epoch in trange(args.epochs):
+    train(epoch)
+#torch.save(model.state_dict(), '/recent/drive/My Drive/College/DAML/')
+print("Optimization Finished!")
+print("Total time elapsed: {:.4f}s".format(time.time() - t_total))
+
+#Keith: 1282 - 1300 are used to test the model
+def test():
+    model.eval()
+    output = model(features, adj)
+
+    loss_test = F.nll_loss(output[idx_test], labels[idx_test])
+
+    # print(output[idx_test],'output[idx_test]')
+    # print(labels_df.columns)
+    # print(labels[idx_test],'labels[idx_test]')
+    # writer.add_scalar('Loss/test', loss_test, epoch)
+    print(df_merged_labels.iloc[idx_test]['Object'])
+    print(df_merged_labels.iloc[:, 13:].columns)
+
+    acc_test = accuracy(output[idx_test], labels[idx_test])
+    print("Test set results:",
+          "loss= {:.4f}".format(loss_test.item()),
+          "accuracy= {:.4f}".format(acc_test.item()))
+
+test()
+
